@@ -1,0 +1,636 @@
+---
+title: "MPRA analysis"
+author: "Grace Hansen"
+date: "3/31/2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = '~/projects/MPRA/WHR')
+library(preprocessCore)
+library(qqman)
+library(data.table)
+library(tidyverse)
+library(circlize)
+pony_colors<-fread("~/medusa/papers/TWAS/pony_palette")
+
+```
+
+This dataset is MPRA for 3T3-L1 mouse adipocytes
+4 technical replicates, 1 input library
+
+### Get barcode counts
+```{r get_counts, echo=FALSE}
+#cmd="~/projects/MPRA/scripts/get_counts.sh WHR"
+#system(cmd)
+samples<-fread("samples",header=FALSE)
+files<-paste("seq/",samples$V2,sep='')
+samples<-samples$V3
+reps<-samples[-1]
+```
+
+### Read in barcode counts, reverse order of string, convert string into its complement
+``` {r revcomp, include=FALSE}
+get_revcomp<-function(input) {
+    counts<-read_delim(paste("counts/",input,".counts",sep='')," ",
+                       escape_double=FALSE,col_names=FALSE,trim_ws=TRUE)
+    reversed<-sapply(lapply(strsplit(counts$X2, NULL), rev), paste, collapse="")
+    rev_complement<-chartr("ATGCN","TACGN", reversed)
+    dat<-cbind(rev_complement,counts)
+    colnames(dat)<-c("barcode",paste("counts_",input,sep=''),"orig_seq")
+    return(dat)
+}
+
+Input<-get_revcomp("Input")
+Rep1<-get_revcomp("Rep1")
+Rep2<-get_revcomp("Rep2")
+Rep3<-get_revcomp("Rep3")
+Rep4<-get_revcomp("Rep4")
+```
+
+
+### Merge data with SNP and allele info
+```{r get_locs, echo=FALSE}
+#Merge samples by barcode
+dat<-merge(Input,Rep1,by=c("barcode","orig_seq"),all.x=TRUE,all.y=TRUE)
+dat<-merge(dat,Rep2,by=c("barcode","orig_seq"),all.x=TRUE,all.y=TRUE)
+dat<-merge(dat,Rep3,by=c("barcode","orig_seq"),all.x=TRUE,all.y=TRUE)
+dat<-merge(dat,Rep4,by=c("barcode","orig_seq"),all.x=TRUE,all.y=TRUE)
+
+#Merge with SNP and allele info
+rsids<-fread("variants/WHR_adipose_subcutaneous_rsids_oligos.txt")
+dat<-merge(dat,rsids,by="barcode") #Here we get rid of all reads that don't match a barcode
+dat<-dat[grepl("WHR_F",dat$source),]
+dat<-within(dat,rm("enhancer_seq","oligo"))
+```
+
+### Initial QC: number of reads, number of reads corresponding to barcodes, histograms
+``` {r QC1,echo=FALSE,results='hide',fig.keep='all'}
+#How many reads are present in the data, after removing poor alignments?
+all_reads = setNames(c(sum(Input$counts_Input),sum(Rep1$counts_Rep1),sum(Rep2$counts_Rep2),sum(Rep3$counts_Rep3),sum(Rep4$counts_Rep4)),samples)
+
+print("Number of total reads per sample:")
+all_reads
+
+#how many reads overlap barcodes?
+barcode_reads = setNames(c(sum(as.numeric(na.omit(dat$counts_Input))),sum(as.numeric(na.omit(dat$counts_Rep1))),sum(as.numeric(na.omit(dat$counts_Rep2))),sum(as.numeric(na.omit(dat$counts_Rep3))),sum(as.numeric(na.omit(dat$counts_Rep4)))),samples)
+
+print("Reads corresponding to barcodes per sample:")
+barcode_reads
+
+print("Percent reads corresponding to barcodes:")
+paste(format(barcode_reads/all_reads*100,digits=4),"%",sep='')
+
+plot_dat<-dat[,c("barcode","counts_Input","counts_Rep1","counts_Rep2","counts_Rep3","counts_Rep4")]
+ggplot(plot_dat)+
+    geom_density(aes(x=counts_Input,color="Input"))+
+    geom_density(aes(x=counts_Rep1,color="Rep1"))+
+    geom_density(aes(x=counts_Rep2,color="Rep2"))+
+    geom_density(aes(x=counts_Rep3,color="Rep3"))+
+    geom_density(aes(x=counts_Rep4,color="Rep4"))+
+    scale_x_continuous(name="number of reads/barcode",limits=c(0,4000))+
+    scale_color_manual(name="Samples",
+             values = c(Input="black",Rep1="red",Rep2="green",Rep3="blue",Rep4="purple"))+
+    theme_minimal()
+
+```
+
+
+### Get CPM and log2CPM
+
+Convert counts into cpm values.
+```{r get_cpm, echo=FALSE}
+#Turn all counts that are NA to 0: they represent barcodes not found in that time point
+dat[c("counts_Input","counts_Rep1","counts_Rep2","counts_Rep3","counts_Rep4")][is.na(dat[c("counts_Input","counts_Rep1","counts_Rep2","counts_Rep3","counts_Rep4")])] <- 0
+
+cpmdat<-apply(dat[c("counts_Input","counts_Rep1","counts_Rep2","counts_Rep3","counts_Rep4")],2,function(x) x/sum(x)*1e6)
+colnames(cpmdat)<- c("cpm_Input","cpm_Rep1","cpm_Rep2", "cpm_Rep3","cpm_Rep4")
+dat<-cbind(dat,cpmdat)
+
+logdat = apply(dat[c("cpm_Input","cpm_Rep1","cpm_Rep2","cpm_Rep3","cpm_Rep4")], 2, function(x) log((x),2))
+colnames(logdat) = c("log2cpm_Input","log2cpm_Rep1","log2cpm_Rep2", "log2cpm_Rep3","log2cpm_Rep4")
+dat<-cbind(dat,logdat)
+```
+
+
+### QC: agreement between replicates, histogram of log2cpm values, correlation matrix
+``` {r QC2, echo=FALSE}
+ggplot(dat)+
+    geom_point(aes(x=counts_Rep1,y=counts_Rep2))+
+    annotate("text",label=paste("R^2 = ",format(cor(dat$counts_Rep1,dat$counts_Rep2), digits = 4),sep=''),x=60000,y=400000)+
+    theme_minimal()
+
+corr_mat<-as.data.frame(matrix(nrow=5,ncol=5),stringsAsFactors=FALSE)
+counts_dat<-dat[c("counts_Input","counts_Rep1","counts_Rep2","counts_Rep3","counts_Rep4")]
+for (i in 1:ncol(counts_dat)) {
+    for (j in 1:ncol(counts_dat)) {
+        corr_mat[i,j]<-cor(counts_dat[,i],counts_dat[,j])
+    }
+}
+
+print("Correlation between counts/barcode between all replicates and input:")
+corr_mat
+
+plot_dat<-dat[,c("barcode","log2cpm_Input","log2cpm_Rep1","log2cpm_Rep2","log2cpm_Rep3","log2cpm_Rep4")]
+ggplot(plot_dat)+
+    geom_density(aes(x=log2cpm_Input,color="Input"))+
+    geom_density(aes(x=log2cpm_Rep1,color="Rep1"))+
+    geom_density(aes(x=log2cpm_Rep2,color="Rep2"))+
+    geom_density(aes(x=log2cpm_Rep3,color="Rep3"))+
+    geom_density(aes(x=log2cpm_Rep4,color="Rep4"))+
+    scale_x_continuous(name="log2cpm per barcode before filtering out lowly-expressed genes")+
+    scale_color_manual(name="Samples",
+             values = c(Input="black",Rep1="red",Rep2="green",Rep3="blue",Rep4="purple"))+
+    theme_minimal()
+
+
+#remove lowly expressed barcodes
+for (i in which(grepl("log2cpm",colnames(dat)))) {
+    dat<-dat[dat[,i]>=-3,]
+}
+
+plot_dat<-dat[,c("barcode","log2cpm_Input","log2cpm_Rep1","log2cpm_Rep2","log2cpm_Rep3","log2cpm_Rep4")]
+ggplot(plot_dat)+
+    geom_density(aes(x=log2cpm_Input,color="Input"))+
+    geom_density(aes(x=log2cpm_Rep1,color="Rep1"))+
+    geom_density(aes(x=log2cpm_Rep2,color="Rep2"))+
+    geom_density(aes(x=log2cpm_Rep3,color="Rep3"))+
+    geom_density(aes(x=log2cpm_Rep4,color="Rep4"))+
+    scale_x_continuous(name="log2cpm per barcode after filtering out lowly-expressed genes")+
+    scale_color_manual(name="Samples",
+             values = c(Input="black",Rep1="red",Rep2="green",Rep3="blue",Rep4="purple"))+
+    theme_minimal()
+
+```
+
+
+### Determine Activity log2 (output(CPM) - input(CPM)) and quantile normalize
+```{r get_activity, echo=FALSE}
+activity<-apply(dat[c("log2cpm_Rep1","log2cpm_Rep2","log2cpm_Rep3","log2cpm_Rep4")],2,function(x) x-dat$log2cpm_Input)
+colnames(activity)<- c("activity_Rep1","activity_Rep2", "activity_Rep3","activity_Rep4")
+dat<-cbind(dat,activity)
+
+qnorm_dat = normalize.quantiles(as.matrix(dat[c("activity_Rep1","activity_Rep2", "activity_Rep3","activity_Rep4")]))
+qnorm_dat = as.data.frame(qnorm_dat - median(qnorm_dat),stringsAsFactors = FALSE)
+colnames(qnorm_dat) = c("qnorm_Rep1","qnorm_Rep2", "qnorm_Rep3","qnorm_Rep4")
+
+dat = cbind(dat,qnorm_dat)
+```
+
+
+### QC: effects of quantile normalization
+``` {r QC3, echo=FALSE}
+plot_dat<-dat[,c("barcode","activity_Rep1","activity_Rep2","activity_Rep3","activity_Rep4")]
+ggplot(plot_dat)+
+    geom_density(aes(x=activity_Rep1,color="Rep1"))+
+    geom_density(aes(x=activity_Rep2,color="Rep2"))+
+    geom_density(aes(x=activity_Rep3,color="Rep3"))+
+    geom_density(aes(x=activity_Rep4,color="Rep4"))+
+    scale_x_continuous(name="activity per barcode before quantile normalization")+
+    scale_color_manual(name="Samples",
+             values = c(Rep1="red",Rep2="green",Rep3="blue",Rep4="purple"))+
+    theme_minimal()
+
+plot_dat<-dat[,c("barcode","qnorm_Rep1","qnorm_Rep2","qnorm_Rep3","qnorm_Rep4")]
+ggplot(plot_dat)+
+    geom_density(aes(x=qnorm_Rep1,color="Rep1"))+
+    geom_density(aes(x=qnorm_Rep2,color="Rep2"))+
+    geom_density(aes(x=qnorm_Rep3,color="Rep3"))+
+    geom_density(aes(x=qnorm_Rep4,color="Rep4"))+
+    scale_x_continuous(name="activity per barcode after quantile normalization")+
+    scale_color_manual(name="Samples",
+             values = c(Rep1="red",Rep2="green",Rep3="blue",Rep4="purple"))+
+    theme_minimal()
+```
+
+
+### Determine significant enhancers with one sided mann whitney u test
+
+I included barcodes for every allele of variant. If there are 3 or 4 alleles, I test the enhancer activity of a sequence containing each allele. However, for now I'm only testing the major vs. minor allele, as it makes interpretation easier. If I want to look at the other alleles later, I'll need to switch from a Mann-Whitney test to a Kruskal-Wallis test (also available in R).
+```{r sigtest_enhancers, echo=FALSE}
+#Determine how many alleles are present per rsid
+allele_count<-dat %>% group_by(rsid) %>% mutate(numalleles = length(unique(allele)))
+
+print("Number of alleles per rsid:")
+table(allele_count$numalleles)
+
+#Get minor and major allele
+#rsids<-dat[,c("chr","rsid")] %>% distinct(rsid,.keep_all=TRUE)
+#majors<-character()
+#minors<-character()
+#for (i in 1:nrow(rsids)) {
+#    cmd=paste("grep ",rsids[i,2]," ~/midway/genos/GTEx_v8/plink/",rsids[i,1],"_rsids.bim",sep='')
+#    line=strsplit(system(cmd,intern=TRUE),'\t')[[1]]
+#    minor=line[5]
+#    major=line[6]
+#    majors<-c(majors,major)
+#    minors<-c(minors,minor)
+#}
+#majors<-cbind(rsids,majors,rep("major",nrow(rsids)))
+#minors<-cbind(rsids,minors,rep("minor",nrow(rsids)))
+#colnames(majors)<-c("chr","rsid","allele","whichallele")
+#colnames(minors)<-c("chr","rsid","allele","whichallele")
+#rsids<-rbind(majors,minors)
+#write.table(rsids,"variants/major_minor_alleles.txt",row.names=FALSE,quote=FALSE,sep='\t')
+rsids<-fread("variants/major_minor_alleles.txt")
+
+#Subset dat to only main two alleles of each SNP
+dat<-merge(dat,rsids,by=c("chr","rsid","allele")) #Check to make sure this worked
+print(paste("Percent of enhancer sequences kept after removing 3rd and 4th alleles: ",format(nrow(dat)/nrow(olddat)*100,4),"%",sep=''))
+#write.table(dat,"results/barcode_activity.txt",quote=FALSE,sep='\t',row.names=FALSE)
+dat$rsid_allele<-paste(dat$rsid,dat$allele,sep="_")
+    
+#pvalues = data.frame(matrix(ncol = 5))
+#colnames(pvalues) = c("rsid_allele","p_Rep1","p_Rep2","p_Rep3","p_Rep4")
+#rsid_alleles<-unique(sort(paste(dat$rsid,dat$allele,sep="_")))
+#for (i in 1:length(rsid_alleles)){ 
+#    if (sum(dat$rsid_allele==rsid_alleles[i]) >= 7) { #Must be more than 7 examples to calculate p-value
+#        p_Rep1<-wilcox.test(dat$qnorm_Rep1[dat$rsid_allele==rsid_alleles[i]],dat$qnorm_Rep1[dat$rsid_allele!=rsid_alleles[i]],alternative=c("greater"))$p.value
+#        p_Rep2<-wilcox.test(dat$qnorm_Rep2[dat$rsid_allele==rsid_alleles[i]],dat$qnorm_Rep2[dat$rsid_allele!=rsid_alleles[i]],alternative=c("greater"))$p.value
+#        p_Rep3<-wilcox.test(dat$qnorm_Rep3[dat$rsid_allele==rsid_alleles[i]],dat$qnorm_Rep3[dat$rsid_allele!=rsid_alleles[i]],alternative=c("greater"))$p.value
+#        p_Rep4<-wilcox.test(dat$qnorm_Rep4[dat$rsid_allele==rsid_alleles[i]],dat$qnorm_Rep4[dat$rsid_allele!=rsid_alleles[i]],alternative=c("greater"))$p.value
+#        pvalues<-rbind(pvalues,c(rsid_alleles[i],p_Rep1,p_Rep2,p_Rep3,p_Rep4))
+#    }
+#}
+
+#pvalues$q_Rep1 = p.adjust(pvalues$p_Rep1, method = "fdr")
+#pvalues$q_Rep2 = p.adjust(pvalues$p_Rep2, method = "fdr")
+#pvalues$q_Rep3 = p.adjust(pvalues$p_Rep3, method = "fdr")
+#pvalues$q_Rep4 = p.adjust(pvalues$p_Rep4, method = "fdr")
+#pvalues = na.omit(pvalues)
+
+```
+
+
+### Determine number of Significant Enhancers
+```{r num_sig_enhancers, echo=FALSE}
+
+#print(paste("Number of tested alleles: ",nrow(pvalues),sep=''))
+#enhancer_sig<-as.data.frame(matrix(nrow=3,ncol=0),stringsAsFactors=FALSE)
+#for (i in reps) {
+#    qval_col=which(colnames(pvalues)==paste("q_",i,sep=''))
+#    sig_pvals<-pvalues[pvalues[,qval_col]<=0.05,]
+#    nonsig_pvals<-pvalues[pvalues[,qval_col]>0.05,]
+#    sig_pvals<-cbind(sig_pvals$rsid_allele,rep(paste("sig_",i,sep=''),nrow(sig_pvals)),rep(1,nrow(sig_pvals)))
+#    colnames(sig_pvals)<-c("rsid_allele","rep","sig")
+#    nonsig_pvals<-cbind(nonsig_pvals$rsid_allele,rep(paste("sig_",i,sep=''),nrow(nonsig_pvals)),rep(0,nrow(nonsig_pvals)))
+#    colnames(nonsig_pvals)<-c("rsid_allele","rep","sig")
+#    enhancer_sig<-rbind(enhancer_sig,sig_pvals,nonsig_pvals)
+#}
+#enhancer_sig<-na.omit(enhancer_sig)
+#enhancer_sig<-pivot_wider(enhancer_sig,id_cols=rsid_allele,names_from=rep,values_from=sig)
+
+#pvalues=merge(pvalues,enhancer_sig,by="rsid_allele")
+
+
+#pvalues$rsid<-sapply(strsplit(pvalues$rsid_allele,'_'),'[[',1)
+#pvalues$allele<-sapply(strsplit(pvalues$rsid_allele,'_'),'[[',2)
+#pvalues$rsid_allele<-NULL
+#pvalues<-pvalues %>% dplyr::select(.,rsid,allele,everything())
+#system("mkdir results/")
+#write.table(pvalues,"results/enhancer_pvalues.txt",quote=FALSE,sep='\t',row.names=FALSE)
+
+pvalues<-fread("results/enhancer_pvalues.txt")
+print(paste("Number of tested alleles: ",nrow(pvalues),sep=''))
+for (i in reps) {
+    qval_col=which(colnames(pvalues)==paste("q_",i,sep=''))
+    sig_pvals<-sum(pvalues[,..qval_col]<=0.05)
+    print(paste("Number of enhancers for ",i," = ",sig_pvals,sep=''))
+    print(paste(format(sig_pvals/nrow(pvalues)*100,digits=4),"% of alleles are enhancers for ",i,sep=''))
+}
+enhancer_dat<-merge(dat,pvalues,by=c("rsid","allele")) %>% distinct(rsid_allele,.keep_all=TRUE)
+
+#Make bed file of significant enhancers
+rsids<-fread("variants/WHR_adipose_subcutaneous_rsids.bed")
+colnames(rsids)<-c("chr","pos","pos1","rsid","score","strand","source","allele")
+
+enhancer_dat<-enhancer_dat[rowSums(enhancer_dat[,grepl("sig",colnames(enhancer_dat))]) > 2,] #Significant enhancers: significant in >1 replicate
+print(paste(nrow(enhancer_dat)," alleles in ",length(unique(enhancer_dat$rsid))," rsids are enhancers in 2 or more replicates",sep=''))
+bed<-cbind(enhancer_dat[,c("chr","pos")],enhancer_dat$pos+1,enhancer_dat$rsid,rep(".",nrow(enhancer_dat)),rep(".",nrow(enhancer_dat)))
+colnames(bed)<-c("chr","pos","pos1","rsid","score","strand")
+bed<-merge(bed,rsids[,c("rsid","source")],all.x=TRUE,by="rsid") %>% select(.,chr,pos,pos1,rsid,score,strand,source) %>% distinct(rsid,.keep_all=TRUE)
+#write.table(bed,"results/sig_enhancers.bed",quote=FALSE,sep='\t',col.names=FALSE,row.names=FALSE)
+```
+
+
+### Determine EMVars with one sided mann whitney u test, considering only significant enhancers
+```{r sigtest_EMVars, include=FALSE}
+DA_pvalues = data.frame(matrix(ncol = 5))
+colnames(DA_pvalues) = c("rsid","p_Rep1","p_Rep2","p_Rep3","p_Rep4")
+rsids<-unique(sort(enhancer_dat$rsid))
+for (i in 1:length(rsids)){ 
+    if (length(unique(enhancer_dat$allele[enhancer_dat$rsid==rsids[i]]))==2) { #Must have both sides of allele
+        dat_allele1<-dat[dat$rsid==rsids[i] & dat$allele==unique(enhancer_dat$allele[enhancer_dat$rsid==rsids[i]])[1],]
+        dat_allele2<-dat[dat$rsid==rsids[i] & dat$allele==unique(enhancer_dat$allele[enhancer_dat$rsid==rsids[i]])[2],]
+        p_Rep1<-wilcox.test(dat_allele1$qnorm_Rep1,dat_allele2$qnorm_Rep1,alternative=c("two.sided"))$p.value
+        p_Rep2<-wilcox.test(dat_allele1$qnorm_Rep2,dat_allele2$qnorm_Rep2,alternative=c("two.sided"))$p.value
+        p_Rep3<-wilcox.test(dat_allele1$qnorm_Rep3,dat_allele2$qnorm_Rep3,alternative=c("two.sided"))$p.value
+        p_Rep4<-wilcox.test(dat_allele1$qnorm_Rep4,dat_allele2$qnorm_Rep4,alternative=c("two.sided"))$p.value
+        DA_pvalues<-rbind(DA_pvalues,c(rsids[i],p_Rep1,p_Rep2,p_Rep3,p_Rep4))
+    }
+}
+
+DA_pvalues$q_Rep1 = p.adjust(DA_pvalues$p_Rep1, method = "fdr")
+DA_pvalues$q_Rep2 = p.adjust(DA_pvalues$p_Rep2, method = "fdr")
+DA_pvalues$q_Rep3 = p.adjust(DA_pvalues$p_Rep3, method = "fdr")
+DA_pvalues$q_Rep4 = p.adjust(DA_pvalues$p_Rep4, method = "fdr")
+
+DA_pvalues = na.omit(DA_pvalues)
+
+```
+
+### Count significant EMVars
+```{r num_sig_EMVars, echo=FALSE}
+print(paste("Number of tested rsids with significant allele: ",length(rsids),sep=''))
+DA_sig<-as.data.frame(matrix(nrow=3,ncol=0),stringsAsFactors=FALSE)
+for (i in reps) {
+    qval_col=which(colnames(DA_pvalues)==paste("q_",i,sep=''))
+    sig_pvals<-DA_pvalues[DA_pvalues[,qval_col]<=0.05,]
+    nonsig_pvals<-DA_pvalues[DA_pvalues[,qval_col]>0.05,]
+    print(paste("Number of EMVars for ",i," = ",nrow(sig_pvals),sep=''))
+    print(paste(format(nrow(sig_pvals)/nrow(DA_pvalues)*100,digits=4),"% of significant rsids are EMVars in ",i,sep=''))
+    sig_pvals<-cbind(sig_pvals$rsid,rep(paste("sig_",i,sep=''),nrow(sig_pvals)),rep(1,nrow(sig_pvals)))
+    colnames(sig_pvals)<-c("rsid","rep","sig")
+    nonsig_pvals<-cbind(nonsig_pvals$rsid,rep(paste("sig_",i,sep=''),nrow(nonsig_pvals)),rep(0,nrow(nonsig_pvals)))
+    colnames(nonsig_pvals)<-c("rsid","rep","sig")
+    DA_sig<-rbind(DA_sig,sig_pvals,nonsig_pvals)
+}
+DA_sig<-na.omit(DA_sig)
+DA_sig$sig<-as.numeric(as.character(DA_sig$sig))
+DA_sig<-pivot_wider(DA_sig,id_cols=rsid,names_from=rep,values_from=sig)
+
+DA_pvalues=merge(DA_pvalues,DA_sig,by="rsid")
+DA_dat<-merge(dat,DA_pvalues,by="rsid") %>% distinct(rsid,.keep_all=TRUE)
+#write.table(DA_pvalues,"results/DA_pvalues.txt",quote=FALSE,sep='\t',row.names=FALSE)
+
+#Make bed file of significant EMVars
+rsids<-fread("variants/WHR_adipose_subcutaneous_rsids.bed")
+colnames(rsids)<-c("chr","pos","pos1","rsid","score","strand","source","allele")
+
+DA_dat<-DA_dat[rowSums(DA_dat[,grepl("sig",colnames(DA_dat))]) > 2,]
+print(paste(nrow(DA_dat)," alleles in ",length(unique(DA_dat$rsid))," rsids are EMVars in 2 or more replicates",sep=''))
+bed<-cbind(DA_dat[,c("chr","pos")],DA_dat$pos+1,DA_dat$rsid,rep(".",nrow(DA_dat)),rep(".",nrow(DA_dat)))
+colnames(bed)<-c("chr","pos","pos1","rsid","score","strand")
+bed<-merge(bed,rsids[,c("rsid","source")],all.x=TRUE,by="rsid") %>% select(.,chr,pos,pos1,rsid,score,strand,source)
+#write.table(bed,"results/sig_EMVars.bed",quote=FALSE,sep='\t',col.names=FALSE,row.names=FALSE)
+```
+
+### Plot significant enhancers and EMVars by activity
+``` {r plot_sig,echo=FALSE}
+dat<-dat[dat$rsid %in% pvalues$rsid,]
+dat$meanactivity<-rowMeans(dat[,which(grepl("qnorm",colnames(dat)))])
+dat$sig<-rep("None",nrow(dat))
+dat$sig[dat$rsid %in% enhancer_dat$rsid]<-"Enhancer"
+dat$sig[dat$rsid %in% DA_dat$rsid]<-"EMVar"
+
+A<-ggplot(dat)+
+    geom_histogram(aes(x=meanactivity,fill=sig),bins=50)+
+    theme_minimal()+
+    theme(axis.text=element_text(size=16),
+          axis.title=element_text(size=16),
+          legend.title = element_text(size=16),
+          legend.text = element_text(size=16))+
+    labs(fill="Significance")+
+    scale_x_continuous(name="Normalized log2cpm per barcode")+
+    scale_y_continuous(name="Count")+
+    scale_fill_manual(values=c("darkmagenta","cadetblue4","gray70"))
+A
+#pdf("results/activity_by_barcode.pdf",width = 9,height=6)
+#A
+#dev.off()
+
+```
+
+### LiftOver variants to hg19 for future analyses
+``` {r liftOver,include=FALSE}
+#tested_enhancers<-fread("~/projects/MPRA/WHR/results/barcode_activity.txt")
+#tested_enhancers<-tested_enhancers[,c("chr","pos","rsid")]
+#tested_enhancers$pos1<-tested_enhancers$pos+1
+#tested_enhancers<-tested_enhancers %>% distinct(rsid,.keep_all=TRUE) %>% select(.,chr,pos,pos1,rsid)
+
+#Liftover MPRA enhancers to be in hg19 space
+#write.table(tested_enhancers,"results/tested_enhancers.bed",row.names=FALSE,col.names=FALSE,quote=FALSE,sep='\t')
+#system("liftOver results/sig_EMVars.bed ~/medusa/reference/hg38ToHg19.over.chain.gz results/sig_EMVars_hg19.bed unMapped")
+#system("liftOver results/sig_enhancers.bed ~/medusa/reference/hg38ToHg19.over.chain.gz results/sig_enhancers_hg19.bed unMapped")
+#system("liftOver results/tested_enhancers.bed ~/medusa/reference/hg38ToHg19.over.chain.gz results/tested_enhancers_hg19.bed unMapped")
+```
+
+
+### Make circle plot
+``` {r circle plot, echo=FALSE}
+############################ For color manipulation ############################
+darken <- function(color, factor=1.2){
+  col <- col2rgb(color)
+  col <- col/factor
+  col <- rgb(t(col), maxColorValue=255)
+  col
+}
+################################################################################
+
+################## Gather genes, tested rsids, sig enhancers, and sigEMVars ####################
+genes<-scan("~/midway/expression/WHR_F/adipose_subcutaneous/results/posthoc/sig_genes",what='chraracter',sep='\n')
+hg19genes<-genes
+hg19genes<-gsub("IQCN","KIAA1683",hg19genes) #IQCN only named as such in hg38
+hg19genes<-gsub("MFSD13A","TMEM180",hg19genes)
+hg19genes<-gsub("LRMDA","C10orf11",hg19genes)
+hg19genes<-gsub("PCNX1","PCNX",hg19genes)
+hg19genes<-gsub("CCDC32","C15orf57",hg19genes)
+hg19genes<-gsub("PEAK3","C19orf35",hg19genes)
+
+TSSes<-c()
+chrs<-c()
+genestarts=c()
+genestops=c()
+for (gene in hg19genes) {
+  cmd=paste("awk -F '\t' '$4==\"'",gene,"'\" {print $0}' ~/reference/coding_genes_hg19.bed",sep='')
+  line=system(cmd,intern=TRUE)
+  strand=strsplit(line,'\t')[[1]][6]
+  if (strand=='+') {
+    TSS=strsplit(line,'\t')[[1]][2]
+  } else if (strand=='-') {
+    TSS=strsplit(line,'\t')[[1]][3]
+  }
+  chr<-strsplit(line,'\t')[[1]][1]
+  start<-strsplit(line,'\t')[[1]][2]
+  stop<-strsplit(line,'\t')[[1]][3]
+  TSSes<-c(TSSes,TSS)
+  chrs<-c(chrs,chr)
+  genestarts<-c(genestarts,start)
+  genestops<-c(genestops,stop)
+}
+genes<-cbind(chrs,genes,TSSes,genestarts,genestops)
+colnames(genes)<-c("chr","gene","TSS","genestarts","genestops")
+genes<-as.data.frame(genes,stringsAsFactors = FALSE)
+
+enhancers<-fread("~/projects/MPRA/WHR/results/sig_enhancers_hg19.bed")
+colnames(enhancers)<-c("chr","pos","pos1","rsid","score","strand","source")
+EMVars<-fread("~/projects/MPRA/WHR/results/sig_EMVars_hg19.bed")
+colnames(EMVars)<-c("chr","pos","pos1","rsid","score","strand","source")
+
+############### Plot in a circle plot #################
+  #1 round for genes
+  #1 round for enhancers
+  #1 round for EMVars
+
+# Sort genes
+genes$chr<-sapply(strsplit(genes$chr,'r'),'[[',2)
+genes$chr<-as.numeric(genes$chr)
+genes$genestarts<-as.numeric(genes$genestarts)
+genes$genestops<-as.numeric(genes$genestops)
+genes<-genes %>% arrange(.,chr,genestarts)
+genes$chr<-paste("chr",genes$chr,sep='')
+genes<-genes[,c("chr","genestarts","genestops","gene")]
+colnames(genes)<-c("chr","start","end","gene")
+genes$value1<-rep(0.8,nrow(genes))
+
+#Sort enhancers
+enhancers$chr<-sapply(strsplit(enhancers$chr,'r'),'[[',2)
+enhancers$chr<-as.numeric(enhancers$chr)
+enhancers<-enhancers %>% arrange(.,chr,pos)
+enhancers$value1<-rep(0.8,nrow(enhancers))
+enhancers$value2<-rep(0.1,nrow(enhancers))
+enhancers$chr<-paste("chr",enhancers$chr,sep='')
+enhancers<-enhancers[,c("chr","pos","pos1","value1","value2")]
+colnames(enhancers)<-c("chr","start","end","value1","value2")
+
+#Sort EMVars
+EMVars$chr<-sapply(strsplit(EMVars$chr,'r'),'[[',2)
+EMVars$chr<-as.numeric(EMVars$chr)
+EMVars<-EMVars %>% arrange(.,chr,pos)
+EMVars$value1<-rep(0.8,nrow(EMVars))
+EMVars$value2<-rep(0.1,nrow(EMVars))
+EMVars$chr<-paste("chr",EMVars$chr,sep='')
+EMVars<-EMVars[,c("chr","pos","pos1","value1","value2")]
+colnames(EMVars)<-c("chr","start","end","value1","value2")
+
+#Plot
+pdf("~/projects/MPRA/WHR/results/MPRA_circle.pdf",width=7,height=7)
+circos.clear()
+circos.par("track.height" = 0.25, cell.padding = c(0, 0, 0, 0))
+circos.initializeWithIdeogram(chromosome.index = paste0("chr", 1:22),plotType = NULL)
+circos.track(ylim = c(0, 1), panel.fun = function(x, y) {
+  chr = CELL_META$sector.index
+  xlim = CELL_META$xlim
+  ylim = CELL_META$ylim
+  circos.rect(xlim[1], 0, xlim[2], 1, col = "gray90")
+  circos.text(mean(xlim), mean(ylim), chr, cex = 0.7, col = "black",
+              facing ="clockwise", niceFacing = TRUE)
+}, track.height = 0.15, bg.border = NA)
+circos.genomicLabels(genes[,c("chr","start","end")],side="outside",labels=genes$gene,cex=0.4,padding=0.6)
+circos.genomicTrackPlotRegion(enhancers, bg.border="white",track.height = 0.06,panel.fun = function(region, value, ...) {
+  circos.genomicLines(region, value,type='h',lwd=2,col = darken(rgb(pony_colors[6,1:3])),...)
+})
+circos.genomicTrackPlotRegion(EMVars, bg.border="white",track.height = 0.06,panel.fun = function(region, value, ...) {
+  circos.genomicLines(region, value,type='h',lwd=2,col = darken(rgb(pony_colors[13,1:3])),...)
+})
+dev.off()
+
+circos.clear()
+circos.par("track.height" = 0.25, cell.padding = c(0, 0, 0, 0))
+circos.initializeWithIdeogram(chromosome.index = paste0("chr", 1:22),plotType = NULL)
+circos.track(ylim = c(0, 1), panel.fun = function(x, y) {
+  chr = CELL_META$sector.index
+  xlim = CELL_META$xlim
+  ylim = CELL_META$ylim
+  circos.rect(xlim[1], 0, xlim[2], 1, col = "gray90")
+  circos.text(mean(xlim), mean(ylim), chr, cex = 0.7, col = "black",
+              facing ="clockwise", niceFacing = TRUE)
+}, track.height = 0.15, bg.border = NA)
+circos.genomicLabels(genes[,c("chr","start","end")],side="outside",labels=genes$gene,cex=0.4,padding=0.6)
+circos.genomicTrackPlotRegion(enhancers, bg.border="white",track.height = 0.06,panel.fun = function(region, value, ...) {
+  circos.genomicLines(region, value,type='h',lwd=2,col = darken(rgb(pony_colors[6,1:3])),...)
+})
+circos.genomicTrackPlotRegion(EMVars, bg.border="white",track.height = 0.06,panel.fun = function(region, value, ...) {
+  circos.genomicLines(region, value,type='h',lwd=2,col = darken(rgb(pony_colors[13,1:3])),...)
+})
+```
+
+### Number of EMVars per locus
+``` {r EMVars_per_locus,echo=FALSE}
+#Load sig EMVars
+sig_EMVars<-fread("~/projects/MPRA/WHR/results/sig_EMVars.txt") #This requires some manual curation: extract the associated genes from the source data in sig_EMVars.bed
+sig_EMVars<-sig_EMVars %>% group_by(rsid) %>% mutate(genes=paste(`associated genes`,collapse=',')) %>% distinct(rsid,.keep_all=TRUE)
+
+#Edit ZNF383,ZNF585B so they are one locus
+sig_EMVars$genes[sig_EMVars$genes=="ZNF383"]<-"ZNF383,ZNF585B"
+sig_EMVars$genes[sig_EMVars$genes=="ZNF585B"]<-"ZNF383,ZNF585B"
+gene_order<-sig_EMVars %>% group_by(genes) %>% tally()
+gene_order<-gene_order$genes[order(gene_order$n)]
+sig_EMVars$genes<-factor(sig_EMVars$genes,levels=gene_order)
+
+
+G<-ggplot(sig_EMVars)+
+  geom_bar(aes(x=genes),fill="steelblue4")+
+  theme_minimal()+
+  scale_y_continuous(limits = c(0,13),name="Number of EMVars per locus")+
+  theme(axis.title.y=element_blank(),
+        axis.title.x=element_text(size=18),
+        axis.text=element_text(size=18))+
+  coord_flip()
+
+pdf("~/projects/MPRA/WHR/results/EMVars_per_locus.pdf",width=6,height=8)
+G
+dev.off()
+G
+```
+
+### Violin plots of most significant EMVars
+``` {r violin_plots,echo=FALSE}
+N=10 
+#Load EMVars
+EMVars<-fread("~/projects/MPRA/WHR/results/sig_EMVars.bed")
+colnames(EMVars)<-c("chr","pos","pos1","rsid","dot","dot1","source")
+
+#Load EMVar p-values
+pvals<-fread("~/projects/MPRA/WHR/results/DA_pvalues.txt")
+pvals<-pvals[pvals$rsid %in% EMVars$rsid,]
+
+#Load barcode activity
+activity<-as.data.frame(fread("~/projects/MPRA/WHR/results/barcode_activity.txt"))
+activity<-merge(activity,pvals,by="rsid")
+
+#Stack activity values from each rep on top of one another
+activity<-activity[,c("rsid","allele","barcode","qnorm_Rep1","qnorm_Rep2","qnorm_Rep3","qnorm_Rep4","p_Rep1","p_Rep2","p_Rep3","p_Rep4")]
+activity$minp<-apply(activity[,grep("p_",colnames(activity))],1,FUN=min)
+activity<-pivot_longer(activity,cols=starts_with("p_"),names_to="pvalrep",values_to="pval")
+activity<-pivot_longer(activity,cols=starts_with("qnorm"),names_to="qnormrep",values_to="qnorm") #Falsely created mismatch by barcode, where qnorm_Rep1=pval_Rep2. Corrected in next line 
+activity<-activity[sapply(strsplit(activity$pvalrep,'_'),'[[',2)==sapply(strsplit(activity$qnormrep,'_'),'[[',2),]
+activity$rep<-sapply(strsplit(activity$pvalrep,'_'),'[[',2)
+activity$pvalrep<-NULL
+activity$qnormrep<-NULL
+
+#Make less active allele a different color
+mean_activity<-activity %>% group_by(rsid,allele) %>% summarize(mean=mean(qnorm))
+mean_activity$level<-rep("more",nrow(mean_activity))
+for (rsid in unique((mean_activity$rsid))) {
+  dat<-mean_activity[mean_activity$rsid==rsid,]
+  min=dat$allele[which(dat$mean==min(dat$mean))]
+  mean_activity$level[mean_activity$rsid==rsid & mean_activity$allele==min]<-"less"
+}
+mean_activity<-mean_activity[,c("rsid","allele","level")]
+activity<-merge(activity,mean_activity,by=c("rsid","allele"))
+
+#Make violin plots for top N rsids
+activity<-activity[order(activity$minp),]
+plot_dat<-activity[activity$rsid %in% unique(activity$rsid)[1:N],]
+plot_dat$rsid<-factor(plot_dat$rsid,levels=unique(plot_dat$rsid)[1:N])
+
+V<-ggplot(plot_dat,aes(x=allele,y=qnorm,fill=level))+
+  geom_violin()+
+  geom_jitter(height = 0, width = 0)+
+  scale_y_continuous(name="Barcode activity")+
+  scale_fill_manual(values=c(rgb(pony_colors[10,1:3]),rgb(pony_colors[8,1:3])))+
+  theme_minimal()+
+  theme(legend.position ="none",
+        axis.title.x=element_blank(),
+        axis.title.y=element_text(size=14),
+        axis.text=element_text(size=14),
+        strip.text.x = element_text(size = 14))+
+  facet_wrap("rsid",scales="free")
+
+pdf(paste("~/projects/MPRA/WHR/results/violin_plots_N",N,".pdf",sep=''),width=10,height=10)
+V
+dev.off()
+V
+```
